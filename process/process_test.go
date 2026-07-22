@@ -225,26 +225,30 @@ func TestBlockingFailureAbortsCycle(t *testing.T) {
 }
 
 func TestBackgroundFailureCancelsBlockingStartupStep(t *testing.T) {
+	root := t.TempDir()
 	pm := NewProcessManager()
-	if err := pm.SetRootDirectory(t.TempDir()); err != nil {
+	if err := pm.SetRootDirectory(root); err != nil {
 		t.Fatal(err)
 	}
-	if err := pm.AddProcessSpec(Execute{Name: "frontend", Cmd: "sleep 0.1; exit 23", Type: Background}); err != nil {
+	backgroundCmd := "while [ ! -f readiness-started ]; do sleep 0.01; done; exit 23"
+	if err := pm.AddProcessSpec(Execute{Name: "frontend", Cmd: backgroundCmd, Type: Background}); err != nil {
 		t.Fatal(err)
 	}
-	if err := pm.AddProcessSpec(Execute{Name: "readiness", Cmd: "sleep 30", Type: Once}); err != nil {
+	if err := pm.AddProcessSpec(Execute{Name: "readiness", Cmd: "touch readiness-started; sleep 30", Type: Once}); err != nil {
 		t.Fatal(err)
 	}
 	if err := pm.AddProcessSpec(Execute{Name: "application", Cmd: "sleep 30", Type: Primary}); err != nil {
 		t.Fatal(err)
 	}
+	defer pm.Shutdown()
 
 	started := time.Now()
 	err := pm.Start(context.Background())
 	if err == nil {
 		t.Fatal("expected Start to fail when the background process exits")
 	}
-	if !strings.Contains(err.Error(), `background process "frontend" exited during startup`) {
+	want := `background process "` + backgroundCmd + `" exited during startup`
+	if !strings.Contains(err.Error(), want) {
 		t.Fatalf("Start error = %q, want background startup failure", err)
 	}
 	if elapsed := time.Since(started); elapsed > 5*time.Second {
@@ -253,25 +257,28 @@ func TestBackgroundFailureCancelsBlockingStartupStep(t *testing.T) {
 	if primary := pm.Processes[2]; primary.cmd != nil {
 		t.Error("primary should not have started after the background failure")
 	}
-	pm.Shutdown()
 }
 
 func TestBackgroundFailureAfterStartupDoesNotStopPrimary(t *testing.T) {
+	root := t.TempDir()
 	pm := NewProcessManager()
-	if err := pm.SetRootDirectory(t.TempDir()); err != nil {
+	if err := pm.SetRootDirectory(root); err != nil {
 		t.Fatal(err)
 	}
-	if err := pm.AddProcessSpec(Execute{Name: "frontend", Cmd: "sleep 0.2; exit 23", Type: Background}); err != nil {
+	if err := pm.AddProcessSpec(Execute{Name: "frontend", Cmd: "while [ ! -f stop-background ]; do sleep 0.01; done; exit 23", Type: Background}); err != nil {
 		t.Fatal(err)
 	}
 	if err := pm.AddProcessSpec(Execute{Name: "application", Cmd: "sleep 30", Type: Primary}); err != nil {
 		t.Fatal(err)
 	}
 
+	defer pm.Shutdown()
 	if err := pm.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	defer pm.Shutdown()
+	if err := os.WriteFile(filepath.Join(root, "stop-background"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	if !waitFor(func() bool {
 		return pm.Snapshot()[0].State == StateFailed
