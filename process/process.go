@@ -3,6 +3,7 @@ package process
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -204,17 +205,25 @@ func (pm *ProcessManager) Start(ctx context.Context) error {
 	if len(pm.Processes) == 0 {
 		return errors.New("no processes configured")
 	}
-	return pm.runCycle(ctx, true)
+
+	startupFailures := make(chan error, 1)
+	return pm.runCycle(ctx, true, startupFailures)
 }
 
 // Reload re-runs blocking steps and restarts the primary process. Background and
 // once processes started during Start are left running.
 func (pm *ProcessManager) Reload(ctx context.Context) error {
-	return pm.runCycle(ctx, false)
+	return pm.runCycle(ctx, false, nil)
 }
 
-func (pm *ProcessManager) runCycle(ctx context.Context, firstRun bool) error {
+func (pm *ProcessManager) runCycle(ctx context.Context, firstRun bool, startupFailures chan error) error {
 	for _, p := range pm.Processes {
+		select {
+		case err := <-startupFailures:
+			return err
+		default:
+		}
+
 		// Markers used by the ExecList config form; no-ops in the struct form.
 		if p.Exec == KILL_EXEC || p.Exec == REFRESH_EXEC {
 			continue
@@ -224,7 +233,14 @@ func (pm *ProcessManager) runCycle(ctx context.Context, firstRun bool) error {
 			if !firstRun {
 				continue
 			}
-			if err := pm.startAsync(ctx, p); err != nil {
+
+			onExit := func(err error) {
+				select {
+				case startupFailures <- err:
+				default:
+				}
+			}
+			if err := pm.startAsync(ctx, p, onExit); err != nil {
 				slog.Error("starting background process", "exec", p.Exec, "err", err)
 				return err
 			}
@@ -232,12 +248,12 @@ func (pm *ProcessManager) runCycle(ctx context.Context, firstRun bool) error {
 			if !firstRun {
 				continue
 			}
-			if err := pm.runBlocking(ctx, p); err != nil {
+			if err := pm.runBlocking(ctx, p, startupFailures); err != nil {
 				slog.Error("once process failed", "exec", p.Exec, "err", err)
 				return err
 			}
 		case Blocking:
-			if err := pm.runBlocking(ctx, p); err != nil {
+			if err := pm.runBlocking(ctx, p, startupFailures); err != nil {
 				// On reload a failed blocking step (typically a build error)
 				// aborts the cycle and leaves the current primary running, so a
 				// broken build doesn't take down the last good process.
@@ -246,7 +262,7 @@ func (pm *ProcessManager) runCycle(ctx context.Context, firstRun bool) error {
 			}
 		case Primary:
 			pm.stopProcess(p) // kill the previous instance (no-op on first run)
-			if err := pm.startAsync(ctx, p); err != nil {
+			if err := pm.startAsync(ctx, p, nil); err != nil {
 				slog.Error("starting primary process", "exec", p.Exec, "err", err)
 				return err
 			}
@@ -283,7 +299,7 @@ func (pm *ProcessManager) delayNext(ctx context.Context, p *Process) bool {
 // process group and tracks it so it can be terminated on the next cycle or
 // shutdown. The command is started in a fresh process group so the whole tree
 // can be signalled, not just the direct child.
-func (pm *ProcessManager) startAsync(ctx context.Context, p *Process) error {
+func (pm *ProcessManager) startAsync(ctx context.Context, p *Process, onUnexpectedExit func(error)) error {
 	procCtx, cancel := context.WithCancel(ctx)
 	cmd := generateExec(p.Exec)
 	cmd.Dir = pm.resolveDir(p.Dir)
@@ -322,6 +338,13 @@ func (pm *ProcessManager) startAsync(ctx context.Context, p *Process) error {
 			} else {
 				pm.transition(p, StateExited, 0, 0, nil)
 			}
+			if onUnexpectedExit != nil {
+				if err != nil {
+					onUnexpectedExit(fmt.Errorf("background process %q exited during startup: %w", p.Exec, err))
+				} else {
+					onUnexpectedExit(fmt.Errorf("background process %q exited during startup", p.Exec))
+				}
+			}
 		}
 	}()
 	return nil
@@ -331,7 +354,7 @@ func (pm *ProcessManager) startAsync(ctx context.Context, p *Process) error {
 // group and is bound to ctx, so a shutdown while it is running force-kills the
 // whole tree (not just the direct child, which is all CommandContext would
 // reach) and unblocks the wait.
-func (pm *ProcessManager) runBlocking(ctx context.Context, p *Process) error {
+func (pm *ProcessManager) runBlocking(ctx context.Context, p *Process, startupFailures <-chan error) error {
 	cmd := generateExec(p.Exec)
 	cmd.Dir = pm.resolveDir(p.Dir)
 	cmd.Stdout = pm.stdio(p, "stdout", os.Stdout)
@@ -350,12 +373,9 @@ func (pm *ProcessManager) runBlocking(ctx context.Context, p *Process) error {
 	var err error
 	select {
 	case <-ctx.Done():
-		if kerr := killProcessTree(cmd); kerr != nil {
-			slog.Debug("killing blocking process tree", "exec", p.Exec, "err", kerr)
-		}
-		<-waitErr // reap after the kill
-		pm.transition(p, StateKilled, 0, noExitYet, nil)
-		return ctx.Err()
+		return pm.stopBlocking(p, cmd, waitErr, ctx.Err())
+	case startupErr := <-startupFailures:
+		return pm.stopBlocking(p, cmd, waitErr, startupErr)
 	case err = <-waitErr:
 	}
 	if err != nil {
@@ -364,6 +384,16 @@ func (pm *ProcessManager) runBlocking(ctx context.Context, p *Process) error {
 	}
 	pm.transition(p, StateExited, 0, 0, nil)
 	return nil
+}
+
+func (pm *ProcessManager) stopBlocking(p *Process, cmd *exec.Cmd, waitErr <-chan error, cause error) error {
+	if err := killProcessTree(cmd); err != nil {
+		slog.Debug("killing blocking process tree", "exec", p.Exec, "err", err)
+	}
+	<-waitErr
+	pm.transition(p, StateKilled, 0, noExitYet, nil)
+
+	return cause
 }
 
 // exitCodeOf extracts the process exit code from a completed command, falling

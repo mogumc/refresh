@@ -114,7 +114,9 @@ Typical sequences:
 
 - **blocking/once step:** `Running → Exited` (or `Failed`)
 - **primary:** `Running`, then on each reload `Killed → Running`, and `Killed` at shutdown
-- **background:** `Running` once, `Killed` at shutdown
+- **background:** `Running` once, `Killed` at shutdown. If it exits while the
+  initial process sequence is still running, startup fails and the active
+  `once`/`blocking` step is cancelled.
 
 > `OnProcessEvent` is called **synchronously from the engine's goroutine — do not
 > block in it.** If you need to do real work, hand the event to your own channel
