@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -221,4 +222,72 @@ func TestBlockingFailureAbortsCycle(t *testing.T) {
 		t.Error("primary should not have started after blocking failure")
 	}
 	pm.Shutdown()
+}
+
+func TestBackgroundFailureCancelsBlockingStartupStep(t *testing.T) {
+	root := t.TempDir()
+	pm := NewProcessManager()
+	if err := pm.SetRootDirectory(root); err != nil {
+		t.Fatal(err)
+	}
+	backgroundCmd := "while [ ! -f readiness-started ]; do sleep 0.01; done; exit 23"
+	if err := pm.AddProcessSpec(Execute{Name: "frontend", Cmd: backgroundCmd, Type: Background}); err != nil {
+		t.Fatal(err)
+	}
+	if err := pm.AddProcessSpec(Execute{Name: "readiness", Cmd: "touch readiness-started; sleep 30", Type: Once}); err != nil {
+		t.Fatal(err)
+	}
+	if err := pm.AddProcessSpec(Execute{Name: "application", Cmd: "sleep 30", Type: Primary}); err != nil {
+		t.Fatal(err)
+	}
+	defer pm.Shutdown()
+
+	started := time.Now()
+	err := pm.Start(context.Background())
+	if err == nil {
+		t.Fatal("expected Start to fail when the background process exits")
+	}
+	want := `background process "` + backgroundCmd + `" exited during startup`
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("Start error = %q, want background startup failure", err)
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("Start took %s; readiness step was not cancelled promptly", elapsed)
+	}
+	if primary := pm.Processes[2]; primary.cmd != nil {
+		t.Error("primary should not have started after the background failure")
+	}
+}
+
+func TestBackgroundFailureAfterStartupDoesNotStopPrimary(t *testing.T) {
+	root := t.TempDir()
+	pm := NewProcessManager()
+	if err := pm.SetRootDirectory(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := pm.AddProcessSpec(Execute{Name: "frontend", Cmd: "while [ ! -f stop-background ]; do sleep 0.01; done; exit 23", Type: Background}); err != nil {
+		t.Fatal(err)
+	}
+	if err := pm.AddProcessSpec(Execute{Name: "application", Cmd: "sleep 30", Type: Primary}); err != nil {
+		t.Fatal(err)
+	}
+
+	defer pm.Shutdown()
+	if err := pm.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "stop-background"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if !waitFor(func() bool {
+		return pm.Snapshot()[0].State == StateFailed
+	}) {
+		t.Fatal("background process did not exit")
+	}
+
+	primary := pm.Processes[1]
+	if primary.cmd == nil || !alive(primary.cmd.Process.Pid) {
+		t.Error("primary stopped after a post-startup background failure")
+	}
 }
