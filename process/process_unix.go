@@ -30,3 +30,13 @@ func killProcessTree(cmd *exec.Cmd) error {
 	}
 	return cmd.Process.Kill()
 }
+
+func terminateProcessTree(cmd *exec.Cmd) error {
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
+	if pgid, err := syscall.Getpgid(cmd.Process.Pid); err == nil {
+		return syscall.Kill(-pgid, syscall.SIGTERM)
+	}
+	return cmd.Process.Signal(syscall.SIGTERM)
+}

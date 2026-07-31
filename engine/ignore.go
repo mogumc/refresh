@@ -18,6 +18,32 @@ type Ignore struct {
 	gitPatterns []string
 }
 
+// UnmarshalYAML accepts both Refresh's current `git` key and the historical
+// `git_ignore` key emitted by Wails project templates.
+func (i *Ignore) UnmarshalYAML(unmarshal func(any) error) error {
+	var decoded struct {
+		Dir          []string `yaml:"dir"`
+		File         []string `yaml:"file"`
+		WatchedExten []string `yaml:"watched_extension"`
+		Git          *bool    `yaml:"git"`
+		GitIgnore    *bool    `yaml:"git_ignore"`
+	}
+	if err := unmarshal(&decoded); err != nil {
+		return err
+	}
+	i.Dir = decoded.Dir
+	i.File = decoded.File
+	i.WatchedExten = decoded.WatchedExten
+	i.IgnoreGit = false
+	if decoded.Git != nil {
+		i.IgnoreGit = *decoded.Git
+	}
+	if decoded.GitIgnore != nil {
+		i.IgnoreGit = *decoded.GitIgnore
+	}
+	return nil
+}
+
 // shouldIgnore reports whether a change to path should be skipped. A path is
 // considered only if it matches a watched extension; it is then ignored if it
 // sits in an ignored directory or matches an ignore-file or .gitignore pattern.

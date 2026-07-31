@@ -3,6 +3,7 @@ package engine
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -158,6 +159,12 @@ func (engine *Engine) verifyConfig() error {
 	if t := engine.Config.BackgroundStruct.Type; t != "" && t != process.Background {
 		slog.Warn("background.type is ignored; the background command always runs as a background process", "ignored_type", t)
 	}
+	background := engine.Config.BackgroundStruct
+	if background.Cmd != "" || len(background.Command) > 0 {
+		if err := verifyProcessSpec(background); err != nil {
+			return fmt.Errorf("background: %w", err)
+		}
+	}
 	engine.normalizeExecutes()
 	if err := engine.verifyExecute(); err != nil {
 		return err
@@ -224,7 +231,10 @@ func (engine *Engine) verifyExecute() error {
 		return errors.New("at least one execute must be provided via ExecStruct or ExecList")
 	}
 	primary := 0
-	for _, exe := range engine.Config.ExecStruct {
+	for index, exe := range engine.Config.ExecStruct {
+		if err := verifyProcessSpec(exe); err != nil {
+			return fmt.Errorf("execute %d: %w", index, err)
+		}
 		if exe.Type == process.Primary {
 			primary++
 		}
@@ -233,6 +243,10 @@ func (engine *Engine) verifyExecute() error {
 		return errors.New("only one primary execute can be set")
 	}
 	return nil
+}
+
+func verifyProcessSpec(spec process.Execute) error {
+	return spec.Validate()
 }
 
 // readGitIgnore reads the root .gitignore and returns its entries as globs that
@@ -269,11 +283,25 @@ func (e *Engine) generateProcess() {
 	// Wire the observability hooks before any process is added so snapshots and
 	// events are available for the whole lifecycle.
 	e.ProcessManager.Output = e.Config.Output
-	e.ProcessManager.OnEvent = e.Config.OnProcessEvent
+	e.ProcessManager.OnEvent = func(event process.ProcessEvent) {
+		if e.Config.OnProcessEvent != nil {
+			e.Config.OnProcessEvent(event)
+		}
+		if event.Info.State != process.StateExited && event.Info.State != process.StateFailed {
+			return
+		}
+		if event.Info.ExitPolicy != process.ExitPolicyShutdown && event.Info.ExitPolicy != process.ExitPolicyFail {
+			return
+		}
+		select {
+		case e.processExitCh <- event:
+		default:
+		}
+	}
 
 	// A configured background command is started once at startup, survives
 	// reloads, and is killed on shutdown — regardless of any Type set on it.
-	if bg := e.Config.BackgroundStruct; bg.Cmd != "" {
+	if bg := e.Config.BackgroundStruct; bg.Cmd != "" || len(bg.Command) > 0 {
 		bg.Type = process.Background
 		_ = e.ProcessManager.AddProcessSpec(bg)
 	}

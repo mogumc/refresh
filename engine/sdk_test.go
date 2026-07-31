@@ -6,6 +6,9 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -342,5 +345,81 @@ func TestCancelDuringStartupKillsStartedProcesses(t *testing.T) {
 	}
 	if !waitFor(func() bool { return !pidAlive(bgPID) }) {
 		t.Errorf("background pid %d survived shutdown — orphaned", bgPID)
+	}
+}
+
+func TestPrimaryExitPolicyShutsDownSessionCleanly(t *testing.T) {
+	root := t.TempDir()
+	cfg := Config{
+		RootPath: root,
+		LogLevel: "mute",
+		Debounce: 100,
+		Ignore:   Ignore{WatchedExten: []string{"*.go"}},
+		ExecStruct: []Execute{
+			{
+				Name: "frontend", Type: Background, ShutdownTimeout: "1s",
+				Cmd: `trap 'touch frontend-stopped; exit 0' TERM; touch frontend-ready; while :; do sleep 1; done`,
+			},
+			{
+				Name: "app", Type: Primary, ExitPolicy: ExitPolicyShutdown,
+				Cmd: `while [ ! -f frontend-ready ]; do sleep 0.01; done`,
+			},
+		},
+	}
+	eng, err := NewEngineFromConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewEngineFromConfig: %v", err)
+	}
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- eng.Run(context.Background()) }()
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("Run returned %v, want clean shutdown", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not stop after primary exited")
+	}
+	if _, err := os.Stat(filepath.Join(root, "frontend-stopped")); err != nil {
+		t.Fatalf("frontend was not gracefully stopped: %v", err)
+	}
+}
+
+func TestFailExitPolicyFailsSessionAndStopsPrimary(t *testing.T) {
+	root := t.TempDir()
+	cfg := Config{
+		RootPath: root,
+		LogLevel: "mute",
+		Debounce: 100,
+		Ignore:   Ignore{WatchedExten: []string{"*.go"}},
+		ExecStruct: []Execute{
+			{
+				Name: "frontend", Type: Background, ExitPolicy: ExitPolicyFail,
+				Cmd: `while [ ! -f app-ready ]; do sleep 0.01; done; exit 7`,
+			},
+			{
+				Name: "app", Type: Primary, ShutdownTimeout: "1s",
+				Cmd: `trap 'touch app-stopped; exit 0' TERM; touch app-ready; while :; do sleep 1; done`,
+			},
+		},
+	}
+	eng, err := NewEngineFromConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewEngineFromConfig: %v", err)
+	}
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- eng.Run(context.Background()) }()
+	select {
+	case err := <-runErr:
+		if err == nil || !strings.Contains(err.Error(), "frontend") {
+			t.Fatalf("Run returned %v, want frontend failure", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not stop after frontend failed")
+	}
+	if _, err := os.Stat(filepath.Join(root, "app-stopped")); err != nil {
+		t.Fatalf("primary was not gracefully stopped: %v", err)
 	}
 }

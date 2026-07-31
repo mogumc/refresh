@@ -33,8 +33,13 @@ type ProcessInfo struct {
 	Name string
 	// Exec is the configured command string.
 	Exec string
+	// Command is the exact executable and arguments when the process was
+	// configured without a shell. It is empty for legacy Cmd processes.
+	Command []string
 	// Type is the process's execute type (background, once, blocking, primary).
 	Type ExecuteType
+	// ExitPolicy describes how a natural process exit affects the owning engine.
+	ExitPolicy ExitPolicy
 	// State is the lifecycle state at the moment the snapshot was taken.
 	State ProcessState
 	// PID is the operating-system process id, or 0 when not running.
@@ -75,15 +80,17 @@ const noExitYet = -1
 func (p *Process) info() ProcessInfo {
 	name := p.Name
 	if name == "" {
-		name = p.Exec
+		name = p.displayCommand()
 	}
 	return ProcessInfo{
-		Name:      name,
-		Exec:      p.Exec,
-		Type:      p.Type,
-		State:     p.state,
-		PID:       p.pid,
-		StartedAt: p.startedAt,
-		ExitCode:  p.exitCode,
+		Name:       name,
+		Exec:       p.Exec,
+		Command:    append([]string(nil), p.Command...),
+		Type:       p.Type,
+		ExitPolicy: p.ExitPolicy,
+		State:      p.state,
+		PID:        p.pid,
+		StartedAt:  p.startedAt,
+		ExitCode:   p.exitCode,
 	}
 }

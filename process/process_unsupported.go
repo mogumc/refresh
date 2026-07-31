@@ -2,7 +2,10 @@
 
 package process
 
-import "os/exec"
+import (
+	"os"
+	"os/exec"
+)
 
 // shellInvocation falls back to /bin/sh on platforms without a known shell.
 func shellInvocation(command string) (string, []string) {
@@ -18,4 +21,11 @@ func killProcessTree(cmd *exec.Cmd) error {
 		return nil
 	}
 	return cmd.Process.Kill()
+}
+
+func terminateProcessTree(cmd *exec.Cmd) error {
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
+	return cmd.Process.Signal(os.Interrupt)
 }

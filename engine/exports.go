@@ -9,6 +9,7 @@ import "github.com/atterpac/refresh/process"
 type (
 	Execute     = process.Execute
 	ExecuteType = process.ExecuteType
+	ExitPolicy  = process.ExitPolicy
 
 	// Observability types for SDK consumers (e.g. a TUI) tapping per-process
 	// output and lifecycle. See the process package for documentation.
@@ -20,10 +21,13 @@ type (
 )
 
 var (
-	Background = process.Background
-	Once       = process.Once
-	Blocking   = process.Blocking
-	Primary    = process.Primary
+	Background         = process.Background
+	Once               = process.Once
+	Blocking           = process.Blocking
+	Primary            = process.Primary
+	ExitPolicyIgnore   = process.ExitPolicyIgnore
+	ExitPolicyShutdown = process.ExitPolicyShutdown
+	ExitPolicyFail     = process.ExitPolicyFail
 
 	StatePending = process.StatePending
 	StateRunning = process.StateRunning

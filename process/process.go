@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,10 +19,17 @@ import (
 type Process struct {
 	// Name is a stable identifier for the process, used by consumers as a key for
 	// a per-process log pane. Defaults to Exec when empty.
-	Name string
-	Exec string
-	Type ExecuteType
-	Dir  string
+	Name            string
+	Exec            string
+	Command         []string
+	Env             map[string]string
+	ReadyTCP        string
+	ReadyTimeout    time.Duration
+	ReadyInterval   time.Duration
+	ShutdownTimeout time.Duration
+	ExitPolicy      ExitPolicy
+	Type            ExecuteType
+	Dir             string
 	// Delay is the pause in milliseconds inserted after this process's step
 	// completes, before the next configured process starts. Zero means no pause.
 	Delay int
@@ -78,19 +86,33 @@ func (pm *ProcessManager) AddProcessWithDelay(exec, typing, dir string, delay in
 // AddProcessSpec appends a process from a full Execute spec, preserving its Name
 // (used as the per-process identifier in snapshots and events).
 func (pm *ProcessManager) AddProcessSpec(spec Execute) error {
+	if err := spec.Validate(); err != nil {
+		return err
+	}
 	execType, err := stringToExecuteType(string(spec.Type))
 	if err != nil {
 		return err
 	}
-	pm.Processes = append(pm.Processes, &Process{
-		Name:     spec.Name,
-		Exec:     spec.Cmd,
-		Type:     execType,
-		Dir:      spec.ChangeDir,
-		Delay:    spec.DelayNext,
-		state:    StatePending,
-		exitCode: noExitYet,
-	})
+	shutdownTimeout, _ := parseOptionalDuration(spec.ShutdownTimeout)
+	process := &Process{
+		Name:            spec.Name,
+		Exec:            spec.Cmd,
+		Command:         append([]string(nil), spec.Command...),
+		Env:             cloneEnvironment(spec.Env),
+		Type:            execType,
+		Dir:             spec.ChangeDir,
+		Delay:           spec.DelayNext,
+		state:           StatePending,
+		exitCode:        noExitYet,
+		ShutdownTimeout: shutdownTimeout,
+		ExitPolicy:      spec.ExitPolicy,
+	}
+	if spec.Readiness != nil {
+		process.ReadyTCP = spec.Readiness.TCP
+		process.ReadyTimeout, _ = readinessDuration(spec.Readiness.Timeout, 30*time.Second)
+		process.ReadyInterval, _ = readinessDuration(spec.Readiness.Interval, 100*time.Millisecond)
+	}
+	pm.Processes = append(pm.Processes, process)
 	return nil
 }
 
@@ -159,7 +181,7 @@ func (pm *ProcessManager) stdio(p *Process, stream string, fallback io.Writer) i
 func (pm *ProcessManager) GetExecutes() []string {
 	execs := make([]string, 0, len(pm.Processes))
 	for _, p := range pm.Processes {
-		execs = append(execs, p.Exec)
+		execs = append(execs, p.displayCommand())
 	}
 	return execs
 }
@@ -205,7 +227,6 @@ func (pm *ProcessManager) Start(ctx context.Context) error {
 	if len(pm.Processes) == 0 {
 		return errors.New("no processes configured")
 	}
-
 	startupFailures := make(chan error, 1)
 	return pm.runCycle(ctx, true, startupFailures)
 }
@@ -233,7 +254,6 @@ func (pm *ProcessManager) runCycle(ctx context.Context, firstRun bool, startupFa
 			if !firstRun {
 				continue
 			}
-
 			onExit := func(err error) {
 				select {
 				case startupFailures <- err:
@@ -241,7 +261,10 @@ func (pm *ProcessManager) runCycle(ctx context.Context, firstRun bool, startupFa
 				}
 			}
 			if err := pm.startAsync(ctx, p, onExit); err != nil {
-				slog.Error("starting background process", "exec", p.Exec, "err", err)
+				slog.Error("starting background process", "exec", p.displayCommand(), "err", err)
+				return err
+			}
+			if err := pm.waitUntilReady(ctx, p); err != nil {
 				return err
 			}
 		case Once:
@@ -249,7 +272,7 @@ func (pm *ProcessManager) runCycle(ctx context.Context, firstRun bool, startupFa
 				continue
 			}
 			if err := pm.runBlocking(ctx, p, startupFailures); err != nil {
-				slog.Error("once process failed", "exec", p.Exec, "err", err)
+				slog.Error("once process failed", "exec", p.displayCommand(), "err", err)
 				return err
 			}
 		case Blocking:
@@ -257,13 +280,16 @@ func (pm *ProcessManager) runCycle(ctx context.Context, firstRun bool, startupFa
 				// On reload a failed blocking step (typically a build error)
 				// aborts the cycle and leaves the current primary running, so a
 				// broken build doesn't take down the last good process.
-				slog.Error("blocking process failed", "exec", p.Exec, "err", err)
+				slog.Error("blocking process failed", "exec", p.displayCommand(), "err", err)
 				return err
 			}
 		case Primary:
 			pm.stopProcess(p) // kill the previous instance (no-op on first run)
 			if err := pm.startAsync(ctx, p, nil); err != nil {
-				slog.Error("starting primary process", "exec", p.Exec, "err", err)
+				slog.Error("starting primary process", "exec", p.displayCommand(), "err", err)
+				return err
+			}
+			if err := pm.waitUntilReady(ctx, p); err != nil {
 				return err
 			}
 		}
@@ -278,6 +304,34 @@ func (pm *ProcessManager) runCycle(ctx context.Context, firstRun bool, startupFa
 	return nil
 }
 
+func (pm *ProcessManager) waitUntilReady(ctx context.Context, p *Process) error {
+	if p.ReadyTCP == "" {
+		return nil
+	}
+	timeout := time.NewTimer(p.ReadyTimeout)
+	defer timeout.Stop()
+	ticker := time.NewTicker(p.ReadyInterval)
+	defer ticker.Stop()
+	dialer := net.Dialer{Timeout: p.ReadyInterval}
+	for {
+		connection, err := dialer.DialContext(ctx, "tcp", p.ReadyTCP)
+		if err == nil {
+			_ = connection.Close()
+			slog.Debug("process is ready", "exec", p.displayCommand(), "tcp", p.ReadyTCP)
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-p.done:
+			return fmt.Errorf("process %q exited before becoming ready on %s", p.displayCommand(), p.ReadyTCP)
+		case <-timeout.C:
+			return fmt.Errorf("process %q did not become ready on %s within %s", p.displayCommand(), p.ReadyTCP, p.ReadyTimeout)
+		case <-ticker.C:
+		}
+	}
+}
+
 // delayNext holds for the process's configured delay_next before the cycle moves
 // on, letting one step settle (e.g. a service binding a port) before the next
 // starts. The wait is context-aware; it returns false if the context is
@@ -286,7 +340,7 @@ func (pm *ProcessManager) delayNext(ctx context.Context, p *Process) bool {
 	if p.Delay <= 0 {
 		return true
 	}
-	slog.Debug("delaying before next process", "exec", p.Exec, "ms", p.Delay)
+	slog.Debug("delaying before next process", "exec", p.displayCommand(), "ms", p.Delay)
 	select {
 	case <-ctx.Done():
 		return false
@@ -301,13 +355,14 @@ func (pm *ProcessManager) delayNext(ctx context.Context, p *Process) bool {
 // can be signalled, not just the direct child.
 func (pm *ProcessManager) startAsync(ctx context.Context, p *Process, onUnexpectedExit func(error)) error {
 	procCtx, cancel := context.WithCancel(ctx)
-	cmd := generateExec(p.Exec)
+	cmd := p.command()
 	cmd.Dir = pm.resolveDir(p.Dir)
+	cmd.Env = processEnvironment(p.Env)
 	cmd.Stdout = pm.stdio(p, "stdout", os.Stdout)
 	cmd.Stderr = pm.stdio(p, "stderr", os.Stderr)
 	setProcessGroup(cmd)
 
-	slog.Debug("starting process", "exec", p.Exec, "dir", cmd.Dir)
+	slog.Debug("starting process", "exec", p.displayCommand(), "dir", cmd.Dir)
 	if err := cmd.Start(); err != nil {
 		cancel()
 		pm.transition(p, StateFailed, 0, noExitYet, err)
@@ -326,23 +381,22 @@ func (pm *ProcessManager) startAsync(ctx context.Context, p *Process, onUnexpect
 		go func() { waitErr <- cmd.Wait() }()
 		select {
 		case <-procCtx.Done():
-			if err := killProcessTree(cmd); err != nil {
-				slog.Debug("killing process tree", "exec", p.Exec, "err", err)
+			if err := stopProcessTree(cmd, waitErr, p.ShutdownTimeout); err != nil {
+				slog.Debug("killing process tree", "exec", p.displayCommand(), "err", err)
 			}
-			<-waitErr // reap the process after the kill
 			pm.transition(p, StateKilled, 0, noExitYet, nil)
 		case err := <-waitErr:
 			if err != nil {
-				slog.Debug("process exited", "exec", p.Exec, "err", err)
+				slog.Debug("process exited", "exec", p.displayCommand(), "err", err)
 				pm.transition(p, StateFailed, 0, exitCodeOf(cmd, err), err)
 			} else {
 				pm.transition(p, StateExited, 0, 0, nil)
 			}
 			if onUnexpectedExit != nil {
 				if err != nil {
-					onUnexpectedExit(fmt.Errorf("background process %q exited during startup: %w", p.Exec, err))
+					onUnexpectedExit(fmt.Errorf("background process %q exited during startup: %w", p.displayCommand(), err))
 				} else {
-					onUnexpectedExit(fmt.Errorf("background process %q exited during startup", p.Exec))
+					onUnexpectedExit(fmt.Errorf("background process %q exited during startup", p.displayCommand()))
 				}
 			}
 		}
@@ -355,12 +409,13 @@ func (pm *ProcessManager) startAsync(ctx context.Context, p *Process, onUnexpect
 // whole tree (not just the direct child, which is all CommandContext would
 // reach) and unblocks the wait.
 func (pm *ProcessManager) runBlocking(ctx context.Context, p *Process, startupFailures <-chan error) error {
-	cmd := generateExec(p.Exec)
+	cmd := p.command()
 	cmd.Dir = pm.resolveDir(p.Dir)
+	cmd.Env = processEnvironment(p.Env)
 	cmd.Stdout = pm.stdio(p, "stdout", os.Stdout)
 	cmd.Stderr = pm.stdio(p, "stderr", os.Stderr)
 	setProcessGroup(cmd)
-	slog.Debug("running blocking process", "exec", p.Exec, "dir", cmd.Dir)
+	slog.Debug("running blocking process", "exec", p.displayCommand(), "dir", cmd.Dir)
 
 	if err := cmd.Start(); err != nil {
 		pm.transition(p, StateFailed, 0, noExitYet, err)
@@ -387,13 +442,37 @@ func (pm *ProcessManager) runBlocking(ctx context.Context, p *Process, startupFa
 }
 
 func (pm *ProcessManager) stopBlocking(p *Process, cmd *exec.Cmd, waitErr <-chan error, cause error) error {
-	if err := killProcessTree(cmd); err != nil {
-		slog.Debug("killing blocking process tree", "exec", p.Exec, "err", err)
+	if err := stopProcessTree(cmd, waitErr, p.ShutdownTimeout); err != nil {
+		slog.Debug("stopping blocking process tree", "exec", p.displayCommand(), "err", err)
 	}
-	<-waitErr
 	pm.transition(p, StateKilled, 0, noExitYet, nil)
-
 	return cause
+}
+
+func stopProcessTree(cmd *exec.Cmd, wait <-chan error, grace time.Duration) error {
+	if grace <= 0 {
+		err := killProcessTree(cmd)
+		<-wait
+		return err
+	}
+	if err := terminateProcessTree(cmd); err != nil {
+		forceErr := killProcessTree(cmd)
+		<-wait
+		if forceErr != nil {
+			return errors.Join(err, forceErr)
+		}
+		return err
+	}
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-wait:
+		return nil
+	case <-timer.C:
+		err := killProcessTree(cmd)
+		<-wait
+		return err
+	}
 }
 
 // exitCodeOf extracts the process exit code from a completed command, falling

@@ -26,9 +26,10 @@ type Engine struct {
 	// applied. Both are buffered with a non-blocking send so producers never
 	// block. paused is the authoritative pause flag, owned by the setters and
 	// read by the supervisor and Paused.
-	reloadCh chan struct{}
-	wakeCh   chan struct{}
-	paused   atomic.Bool
+	reloadCh      chan struct{}
+	wakeCh        chan struct{}
+	processExitCh chan process.ProcessEvent
+	paused        atomic.Bool
 }
 
 // initControl allocates the control-plane channels. Called by every constructor
@@ -38,6 +39,7 @@ type Engine struct {
 func (engine *Engine) initControl() {
 	engine.reloadCh = make(chan struct{}, 1)
 	engine.wakeCh = make(chan struct{}, 1)
+	engine.processExitCh = make(chan process.ProcessEvent, 1)
 }
 
 // nonBlockingSend pokes a single-slot signal channel without ever blocking the
@@ -229,6 +231,17 @@ func (engine *Engine) run(parent context.Context, trapOSSignals bool) error {
 			if err := engine.ProcessManager.Reload(ctx); err != nil {
 				slog.Error("reload failed", "err", err)
 			}
+		case event := <-engine.processExitCh:
+			cancel()
+			engine.ProcessManager.Shutdown()
+			if event.Info.State == process.StateFailed || event.Info.ExitPolicy == process.ExitPolicyFail {
+				if event.Err != nil {
+					return fmt.Errorf("process %q exited: %w", event.Info.Name, event.Err)
+				}
+				return fmt.Errorf("process %q exited unexpectedly with code %d", event.Info.Name, event.Info.ExitCode)
+			}
+			slog.Info("process exited, stopping refresh", "process", event.Info.Name)
+			return nil
 		}
 	}
 }

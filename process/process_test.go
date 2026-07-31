@@ -4,6 +4,7 @@ package process
 
 import (
 	"context"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -123,6 +124,44 @@ func TestShellFeaturesAreSupported(t *testing.T) {
 	}
 	if got := string(data); got != "one\ntwo\n" {
 		t.Errorf("shell features not honored, out.txt = %q", got)
+	}
+}
+
+func TestStructuredCommandPreservesArgumentsAndEnvironment(t *testing.T) {
+	root := t.TempDir()
+	pm := NewProcessManager()
+	if err := pm.SetRootDirectory(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := pm.AddProcessSpec(Execute{
+		Name:    "structured",
+		Command: []string{"sh", "-c", `printf '%s|%s' "$1" "$WAILS_VALUE" > result`, "sh", "an argument"},
+		Env:     map[string]string{"WAILS_VALUE": "environment value"},
+		Type:    Blocking,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := pm.AddProcessSpec(Execute{Command: []string{"sleep", "30"}, Type: Primary}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := pm.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer pm.Shutdown()
+
+	data, err := os.ReadFile(filepath.Join(root, "result"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(data); got != "an argument|environment value" {
+		t.Fatalf("result = %q", got)
+	}
+	info := pm.Snapshot()[0]
+	if info.Name != "structured" || len(info.Command) != 5 {
+		t.Fatalf("snapshot = %+v", info)
 	}
 }
 
@@ -289,5 +328,143 @@ func TestBackgroundFailureAfterStartupDoesNotStopPrimary(t *testing.T) {
 	primary := pm.Processes[1]
 	if primary.cmd == nil || !alive(primary.cmd.Process.Pid) {
 		t.Error("primary stopped after a post-startup background failure")
+	}
+}
+
+func TestReloadFailurePreservesLastGoodPrimary(t *testing.T) {
+	root := t.TempDir()
+	pm := NewProcessManager()
+	if err := pm.SetRootDirectory(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := pm.AddProcess("test ! -f fail-build", "blocking", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := pm.AddProcess("sleep 30", "primary", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := pm.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer pm.Shutdown()
+	primary := pm.Processes[1]
+	pid := primary.cmd.Process.Pid
+
+	if err := os.WriteFile(filepath.Join(root, "fail-build"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := pm.Reload(ctx); err == nil {
+		t.Fatal("expected reload build to fail")
+	}
+	if primary.cmd == nil || primary.cmd.Process.Pid != pid {
+		t.Fatalf("primary changed after failed reload: got %+v, want pid %d", primary.cmd, pid)
+	}
+	if !alive(pid) {
+		t.Fatalf("last good primary pid %d was killed after failed reload", pid)
+	}
+}
+
+func TestReadinessWaitsForTCP(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	pm := NewProcessManager()
+	if err := pm.SetRootDirectory(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if err := pm.AddProcessSpec(Execute{
+		Command: []string{"sleep", "30"}, Type: Background,
+		Readiness: &Readiness{TCP: listener.Addr().String(), Timeout: "1s", Interval: "10ms"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := pm.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	pm.Shutdown()
+}
+
+func TestReadinessTimeoutStopsStartup(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	listener.Close()
+
+	pm := NewProcessManager()
+	if err := pm.SetRootDirectory(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if err := pm.AddProcessSpec(Execute{
+		Command: []string{"sleep", "30"}, Type: Background,
+		Readiness: &Readiness{TCP: address, Timeout: "50ms", Interval: "10ms"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := pm.Start(ctx); err == nil {
+		t.Fatal("expected readiness timeout")
+	}
+	pm.Shutdown()
+}
+
+func TestGracefulShutdownSignalsProcessTreeBeforeForce(t *testing.T) {
+	root := t.TempDir()
+	pm := NewProcessManager()
+	if err := pm.SetRootDirectory(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := pm.AddProcessSpec(Execute{
+		Cmd:  `trap 'echo stopped > graceful; exit 0' TERM; touch ready; while :; do sleep 1; done`,
+		Type: Primary, ShutdownTimeout: "1s",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := pm.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !waitFor(func() bool {
+		_, err := os.Stat(filepath.Join(root, "ready"))
+		return err == nil
+	}) {
+		t.Fatal("process did not install its signal handler")
+	}
+	pm.Shutdown()
+	if _, err := os.Stat(filepath.Join(root, "graceful")); err != nil {
+		t.Fatalf("process did not handle graceful shutdown: %v", err)
+	}
+}
+
+func TestGracefulShutdownEscalatesAfterTimeout(t *testing.T) {
+	pm := NewProcessManager()
+	if err := pm.SetRootDirectory(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if err := pm.AddProcessSpec(Execute{
+		Cmd: `trap '' TERM; while :; do sleep 1; done`, Type: Primary, ShutdownTimeout: "50ms",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := pm.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	pid := pm.Processes[0].cmd.Process.Pid
+	pm.Shutdown()
+	if !waitFor(func() bool { return !alive(pid) }) {
+		t.Fatalf("process %d survived graceful shutdown escalation", pid)
 	}
 }
