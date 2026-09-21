@@ -347,3 +347,53 @@ Refresh not for you? Here are some popular hot reload alternatives
 - [Air](https://github.com/cosmtrek/air)
 - [Realize](https://github.com/oxequa/realize)
 - [Fresh](https://github.com/gravityblast/fresh)
+
+### Waiting for a service to become ready
+
+Add `readiness` to a background or primary block to hold subsequent steps until
+its endpoint returns HTTP **200**. For example, wait for the frontend before
+building and starting the server:
+
+```yaml
+config:
+  root_path: "."
+  background:
+    cmd: "npm run dev"
+    dir: "frontend"
+    readiness:
+      http: "http://127.0.0.1:5173/"
+      timeout: "60s"
+      interval: "200ms"
+  executes:
+    - cmd: "go build -o ./bin/server"
+      type: blocking
+    - cmd: "./bin/server"
+      type: primary
+```
+
+For TOML, put the same fields under `[config.background.readiness]` or
+`[config.executes.readiness]` immediately after the corresponding execute block:
+
+```toml
+[config.background]
+cmd = "npm run dev"
+dir = "frontend"
+
+[config.background.readiness]
+http = "http://127.0.0.1:5173/"
+timeout = "60s"
+interval = "200ms"
+```
+
+Use exactly one of `http` (an HTTP or HTTPS URL including the port/path) or
+`tcp` (a `host:port` address). HTTP checks use GET, retry connection errors and
+non-200 responses, and do not follow redirects. Defaults are a 30-second timeout
+and a 100-millisecond polling interval; each request is also bounded by the
+interval. A timeout or process exit aborts the cycle before subsequent steps
+start. Shutdown cancels pending checks. Background checks run at startup only;
+primary checks run after each start, including reloads. Readiness applies to
+asynchronous blocks (`background` and `primary`); `once` and `blocking` commands
+already wait for command completion.
+
+In Go, use `Readiness: &engine.Readiness{HTTP: "http://127.0.0.1:5173/", Timeout: "60s"}`
+on your `engine.Execute`.

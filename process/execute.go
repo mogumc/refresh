@@ -2,6 +2,7 @@ package process
 
 import (
 	"fmt"
+	"net/url"
 	"os/exec"
 	"strings"
 	"time"
@@ -36,6 +37,7 @@ type Execute struct {
 
 type Readiness struct {
 	TCP      string `toml:"tcp"      yaml:"tcp"`
+	HTTP     string `toml:"http"     yaml:"http"` // Absolute HTTP(S) URL that must return 200.
 	Timeout  string `toml:"timeout"  yaml:"timeout"`
 	Interval string `toml:"interval" yaml:"interval"`
 }
@@ -56,8 +58,14 @@ func (spec Execute) Validate() error {
 		return fmt.Errorf("invalid exit policy %q", spec.ExitPolicy)
 	}
 	if spec.Readiness != nil {
-		if strings.TrimSpace(spec.Readiness.TCP) == "" {
-			return fmt.Errorf("readiness tcp address must not be empty")
+		if (strings.TrimSpace(spec.Readiness.TCP) != "") == (strings.TrimSpace(spec.Readiness.HTTP) != "") {
+			return fmt.Errorf("readiness requires exactly one of tcp or http")
+		}
+		if spec.Readiness.HTTP != "" {
+			u, err := url.Parse(spec.Readiness.HTTP)
+			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.Fragment != "" {
+				return fmt.Errorf("readiness http must be an absolute HTTP(S) URL without a fragment")
+			}
 		}
 		if _, err := readinessDuration(spec.Readiness.Timeout, 30*time.Second); err != nil {
 			return fmt.Errorf("invalid readiness timeout %q: %w", spec.Readiness.Timeout, err)

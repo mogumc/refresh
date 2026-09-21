@@ -8,6 +8,7 @@ import "github.com/atterpac/refresh/process"
 // import.
 type (
 	Execute     = process.Execute
+	Readiness   = process.Readiness
 	ExecuteType = process.ExecuteType
 	ExitPolicy  = process.ExitPolicy
 

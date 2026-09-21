@@ -5,10 +5,13 @@ package process
 import (
 	"context"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -466,5 +469,43 @@ func TestGracefulShutdownEscalatesAfterTimeout(t *testing.T) {
 	pm.Shutdown()
 	if !waitFor(func() bool { return !alive(pid) }) {
 		t.Fatalf("process %d survived graceful shutdown escalation", pid)
+	}
+}
+
+func TestHTTPReadinessGatesFollowingStep(t *testing.T) {
+	root := t.TempDir()
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := os.Stat(filepath.Join(root, "app-started")); err == nil {
+			t.Error("following step started before readiness succeeded")
+		}
+		if calls.Add(1) < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	pm := NewProcessManager()
+	if err := pm.SetRootDirectory(root); err != nil {
+		t.Fatal(err)
+	}
+	for _, spec := range []Execute{
+		{Cmd: "sleep 30", Type: Background, Readiness: &Readiness{HTTP: server.URL, Timeout: "1s", Interval: "10ms"}},
+		{Cmd: "touch app-started", Type: Blocking},
+	} {
+		if err := pm.AddProcessSpec(spec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	defer pm.Shutdown()
+	if err := pm.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "app-started")); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() < 3 {
+		t.Fatal("did not wait for HTTP 200")
 	}
 }

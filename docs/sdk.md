@@ -356,3 +356,26 @@ engine.EventFunc
 engine.StatePending engine.StateRunning engine.StateExited
 engine.StateFailed  engine.StateKilled
 ```
+
+### HTTP readiness
+
+Set `Execute.Readiness` on a background or primary process to gate later steps:
+
+```go
+frontend := engine.Execute{
+    Cmd: "npm run dev",
+    ChangeDir: "frontend",
+    Type: engine.Background,
+    Readiness: &engine.Readiness{
+        HTTP: "http://127.0.0.1:5173/",
+        Timeout: "60s",
+        Interval: "200ms",
+    },
+}
+```
+
+The check requires HTTP 200 from the configured URL (redirects are not followed).
+Use either `HTTP` or `TCP`, never both. Timeout defaults to `30s`, interval to
+`100ms`; each request is bounded by the interval and overall timeout. Failure
+aborts the cycle; cancellation and process exit interrupt pending requests.
+Background checks run only at startup; primary checks also run on reload.

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,6 +25,7 @@ type Process struct {
 	Command         []string
 	Env             map[string]string
 	ReadyTCP        string
+	ReadyHTTP       string
 	ReadyTimeout    time.Duration
 	ReadyInterval   time.Duration
 	ShutdownTimeout time.Duration
@@ -109,6 +111,7 @@ func (pm *ProcessManager) AddProcessSpec(spec Execute) error {
 	}
 	if spec.Readiness != nil {
 		process.ReadyTCP = spec.Readiness.TCP
+		process.ReadyHTTP = spec.Readiness.HTTP
 		process.ReadyTimeout, _ = readinessDuration(spec.Readiness.Timeout, 30*time.Second)
 		process.ReadyInterval, _ = readinessDuration(spec.Readiness.Interval, 100*time.Millisecond)
 	}
@@ -305,28 +308,67 @@ func (pm *ProcessManager) runCycle(ctx context.Context, firstRun bool, startupFa
 }
 
 func (pm *ProcessManager) waitUntilReady(ctx context.Context, p *Process) error {
-	if p.ReadyTCP == "" {
+	if p.ReadyTCP == "" && p.ReadyHTTP == "" {
 		return nil
 	}
-	timeout := time.NewTimer(p.ReadyTimeout)
-	defer timeout.Stop()
+	readyCtx, cancel := context.WithTimeout(ctx, p.ReadyTimeout)
+	defer cancel()
+	// Cancel an in-flight probe as soon as the process exits.
+	go func(done <-chan struct{}) {
+		select {
+		case <-done:
+			cancel()
+		case <-readyCtx.Done():
+		}
+	}(p.done)
 	ticker := time.NewTicker(p.ReadyInterval)
 	defer ticker.Stop()
 	dialer := net.Dialer{Timeout: p.ReadyInterval}
+	client := &http.Client{
+		Timeout: p.ReadyInterval,
+		// A redirect is not a 200 from the configured endpoint.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	target := p.ReadyTCP
+	if p.ReadyHTTP != "" {
+		target = p.ReadyHTTP
+	}
 	for {
-		connection, err := dialer.DialContext(ctx, "tcp", p.ReadyTCP)
-		if err == nil {
-			_ = connection.Close()
-			slog.Debug("process is ready", "exec", p.displayCommand(), "tcp", p.ReadyTCP)
+		ready := false
+		if p.ReadyHTTP != "" {
+			req, err := http.NewRequestWithContext(readyCtx, http.MethodGet, p.ReadyHTTP, nil)
+			if err != nil {
+				return fmt.Errorf("creating readiness request: %w", err)
+			}
+			response, err := client.Do(req)
+			if err == nil {
+				ready = response.StatusCode == http.StatusOK
+				_ = response.Body.Close()
+			}
+		} else {
+			connection, err := dialer.DialContext(readyCtx, "tcp", p.ReadyTCP)
+			if err == nil {
+				_ = connection.Close()
+				ready = true
+			}
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		select {
+		case <-p.done:
+			return fmt.Errorf("process %q exited before becoming ready on %s", p.displayCommand(), target)
+		default:
+		}
+		if readyCtx.Err() != nil {
+			return fmt.Errorf("process %q did not become ready on %s within %s: %w", p.displayCommand(), target, p.ReadyTimeout, readyCtx.Err())
+		}
+		if ready {
+			slog.Debug("process is ready", "exec", p.displayCommand(), "target", target)
 			return nil
 		}
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-p.done:
-			return fmt.Errorf("process %q exited before becoming ready on %s", p.displayCommand(), p.ReadyTCP)
-		case <-timeout.C:
-			return fmt.Errorf("process %q did not become ready on %s within %s", p.displayCommand(), p.ReadyTCP, p.ReadyTimeout)
+		case <-readyCtx.Done():
 		case <-ticker.C:
 		}
 	}

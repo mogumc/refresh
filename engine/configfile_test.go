@@ -105,3 +105,27 @@ func TestStringToConfigYAML(t *testing.T) {
 		t.Errorf("Debounce = %d, want 7", e.Config.Debounce)
 	}
 }
+
+func TestHTTPReadinessConfig(t *testing.T) {
+	for _, format := range []string{"yaml", "toml"} {
+		t.Run(format, func(t *testing.T) {
+			eng := &Engine{}
+			var err error
+			if format == "yaml" {
+				err = eng.StringtoConfigYAML("config:\n  background:\n    cmd: npm run dev\n    readiness:\n      http: http://localhost:5173/ready\n      timeout: 45s\n      interval: 200ms\n")
+			} else {
+				err = eng.StringtoConfigTOML("[config.background]\ncmd = 'npm run dev'\n[config.background.readiness]\nhttp = 'http://localhost:5173/ready'\ntimeout = '45s'\ninterval = '200ms'\n")
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			check := eng.Config.BackgroundStruct.Readiness
+			if check == nil || check.HTTP != "http://localhost:5173/ready" || check.Timeout != "45s" || check.Interval != "200ms" {
+				t.Fatalf("unexpected readiness: %+v", check)
+			}
+			if err := eng.Config.BackgroundStruct.Validate(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
